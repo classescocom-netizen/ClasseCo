@@ -3782,7 +3782,7 @@ function StudentCombobox({ students, value, searchText, onChange }) {
 }
 
 function SellCourseModal({ ctx, onClose, course, onNavigate }) {
-  const { students, setStudents, enrollments, setEnrollments, setPayments, settings } = ctx;
+  const { students, setStudents, enrollments, setEnrollments, setPayments, settings, t } = ctx;
   const allCats = settings?.categories || DEFAULT_SETTINGS.categories;
   const cat = allCats.find(c => c.id === (course.categoryId || course.category)) || CATEGORIES[course.category] || CATEGORIES.other;
   const isGroup = course.courseType === "group";
