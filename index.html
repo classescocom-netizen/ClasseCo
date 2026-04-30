@@ -826,27 +826,41 @@ const supaSignOut = async () => {
 
 // Fetch user profile + org status — call after login
 const fetchUserContext = async () => {
-  if (!sb) return null;
+  if (!sb) {
+    console.log("[fetchUserContext] supabase not initialized");
+    return null;
+  }
   const { data: { user } } = await sb.auth.getUser();
+  console.log("[fetchUserContext] auth user:", user?.id, user?.email);
   if (!user) return null;
 
   // Get user profile
-  const { data: profile } = await sb
+  const profileRes = await sb
     .from("users")
     .select("*")
     .eq("id", user.id)
-    .single();
+    .maybeSingle();
+  console.log("[fetchUserContext] profile query result:", profileRes);
+  const profile = profileRes.data;
+
+  if (!profile) {
+    console.error("[fetchUserContext] No profile found for user:", user.id);
+    console.error("[fetchUserContext] error details:", profileRes.error);
+    return { user, profile: null, orgStatus: null };
+  }
 
   // Get org status (trial/expiry info)
-  const { data: orgStatus } = await sb
+  const orgRes = await sb
     .from("org_status")
     .select("*")
-    .eq("org_id", profile?.org_id)
-    .single();
+    .eq("org_id", profile.org_id)
+    .maybeSingle();
+  console.log("[fetchUserContext] org_status query result:", orgRes);
+  const orgStatus = orgRes.data;
 
   return {
     user,
-    profile: profile ? camelize(profile) : null,
+    profile: camelize(profile),
     orgStatus: orgStatus ? camelize(orgStatus) : null,
   };
 };
@@ -1663,11 +1677,15 @@ function LoginPage({ onLogin }) {
     if (sb) {
       try {
         setErrMsg("กำลังเข้าสู่ระบบ...");
+        console.log("[login] attempting Supabase login:", tEmail);
         const result = await supaSignIn({ email: tEmail, password: tPass });
+        console.log("[login] Supabase login OK, user_id:", result.user.id);
         // Fetch user context (org status, profile)
         const ctx = await fetchUserContext();
+        console.log("[login] fetchUserContext result:", ctx);
         if (!ctx?.profile) {
-          setErrMsg("ไม่พบข้อมูลผู้ใช้ — โปรดติดต่อ admin");
+          setErrMsg("Login OK แต่ไม่พบ profile — ดู console (F12)");
+          console.error("[login] Profile missing! Check Supabase RLS policies.");
           return;
         }
         onLogin({
@@ -1680,8 +1698,9 @@ function LoginPage({ onLogin }) {
         setErrMsg("");
         return;
       } catch (err) {
-        setErrMsg(err.message || "อีเมลหรือรหัสผ่านไม่ถูกต้อง");
-        setTimeout(() => setErrMsg(""), 3000);
+        console.error("[login] error:", err);
+        setErrMsg("Error: " + (err.message || "ไม่ทราบ"));
+        setTimeout(() => setErrMsg(""), 5000);
         return;
       }
     }
