@@ -642,7 +642,7 @@ window.classescoExportPDF = function(courses, enrollments, allCats, allLvls, act
 };
 </script>
 <script type="text/babel" data-presets="react">
-const { useState, useEffect, useMemo } = React;
+const { useState, useEffect, useMemo, useRef } = React;
 
 // ============ ICONS (inline SVG to avoid external deps) ============
 const Icon = ({ path, size = 14, stroke = 1.5, fill = "none" }) => (
@@ -865,31 +865,232 @@ const fetchUserContext = async () => {
   };
 };
 
-// ============ STORAGE ABSTRACTION ============
-// Currently saves images as base64 dataURL in localStorage.
-// When migrating to Supabase, swap implementation to upload blob → return URL.
+// ============ SUPABASE DATA LAYER ============
+// Strategy:
+// - On mount: fetch from Supabase → set local state
+// - On state change: upsert to Supabase + cache in localStorage
+// - localStorage = cache only (Supabase = source of truth)
 //
-// Usage: const url = await uploadImage(blob, 'photos', `student_${id}.webp`)
-const uploadImage = async (blob, bucket = "uploads", filename = null) => {
-  // === LOCAL MODE (current) ===
-  // Convert to dataURL for localStorage backend
+// Tables map: localStorage key → Supabase table name
+const TABLE_MAP = {
+  students: "students",
+  classes: "classes",
+  payments: "payments",
+  notes: "lesson_notes",
+  courses: "courses",
+  enrollments: "enrollments",
+  bookingRequests: "booking_requests",
+};
+
+// Fetch all rows from a table for current org
+const supaFetchAll = async (tableName, orgId) => {
+  if (!sb || !orgId) return null;
+  try {
+    const { data, error } = await sb
+      .from(tableName)
+      .select("*")
+      .eq("org_id", orgId)
+      .is("deleted_at", null)
+      .order("created_at", { ascending: false });
+    if (error) {
+      console.error(`[supaFetchAll] ${tableName}:`, error);
+      return null;
+    }
+    if (!data) return [];
+    // Camelize + reverse field mapping
+    return data.map(row => {
+      const camel = camelize(row);
+      // Map schema fields back to frontend names
+      if (tableName === "students" && camel.photoUrl) camel.photo = camel.photoUrl;
+      if (tableName === "payments" && camel.slipUrl) camel.slipUrl = camel.slipUrl;
+      return camel;
+    });
+  } catch (err) {
+    console.error(`[supaFetchAll] ${tableName}:`, err);
+    return null;
+  }
+};
+
+// Upsert array of rows to a table
+const supaUpsertAll = async (tableName, rows, orgId) => {
+  if (!sb || !orgId || !rows || rows.length === 0) return;
+  try {
+    const snakeRows = rows.map(r => ({ ...snakeize(r), org_id: orgId }));
+    const { error } = await sb.from(tableName).upsert(snakeRows, { onConflict: "id" });
+    if (error) console.error(`[supaUpsertAll] ${tableName}:`, error);
+  } catch (err) {
+    console.error(`[supaUpsertAll] ${tableName}:`, err);
+  }
+};
+
+// Compute diff between two arrays (by id) — returns inserts/updates/deletes
+const computeArrayDiff = (oldArr, newArr) => {
+  const oldMap = new Map((oldArr || []).map(x => [x.id, x]));
+  const newMap = new Map((newArr || []).map(x => [x.id, x]));
+  const upserts = [];
+  const deletes = [];
+  // upserts = items in new that differ from old (or are new)
+  for (const [id, item] of newMap) {
+    const oldItem = oldMap.get(id);
+    if (!oldItem || JSON.stringify(oldItem) !== JSON.stringify(item)) {
+      upserts.push(item);
+    }
+  }
+  // deletes = items in old but not in new
+  for (const id of oldMap.keys()) {
+    if (!newMap.has(id)) deletes.push(id);
+  }
+  return { upserts, deletes };
+};
+
+// Sync changes to Supabase (called when state changes)
+const supaSync = async (tableName, oldArr, newArr, orgId) => {
+  if (!sb || !orgId) return;
+  const { upserts, deletes } = computeArrayDiff(oldArr, newArr);
+  if (upserts.length === 0 && deletes.length === 0) return;
+
+  try {
+    if (upserts.length > 0) {
+      // Skip rows with non-UUID ids (legacy seed data with ids like "s1", "cr1")
+      const validUpserts = upserts.filter(r => r.id && isUUID(r.id));
+      if (validUpserts.length === 0) {
+        if (upserts.length > 0) console.log(`[supaSync] skipped ${upserts.length} non-UUID rows in ${tableName}`);
+        return;
+      }
+      const snakeRows = validUpserts.map(r => {
+        const snaked = { ...snakeize(r), org_id: orgId };
+        return filterForSchema(snaked, tableName);
+      });
+      console.log(`[supaSync] upserting ${validUpserts.length} rows to ${tableName}`);
+      const { error } = await sb.from(tableName).upsert(snakeRows, { onConflict: "id" });
+      if (error) console.error(`[supaSync upsert] ${tableName}:`, error);
+    }
+    if (deletes.length > 0) {
+      const validDeletes = deletes.filter(id => isUUID(id));
+      if (validDeletes.length === 0) return;
+      console.log(`[supaSync] deleting ${validDeletes.length} rows from ${tableName}`);
+      const { error } = await sb
+        .from(tableName)
+        .update({ deleted_at: new Date().toISOString() })
+        .in("id", validDeletes);
+      if (error) console.error(`[supaSync delete] ${tableName}:`, error);
+    }
+  } catch (err) {
+    console.error(`[supaSync] ${tableName}:`, err);
+  }
+};
+
+// UUID v4 generator
+const newId = () => {
+  if (window.crypto?.randomUUID) return window.crypto.randomUUID();
+  // Fallback
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
+    return v.toString(16);
+  });
+};
+
+// Check if ID is a valid UUID
+const isUUID = (id) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+
+// Schema field allowlist per table — drop unknown fields (legacy fields like 'category' string)
+const SCHEMA_FIELDS = {
+  students: ["id", "org_id", "name", "nickname", "age", "category_id", "level_id", "subcategory", "parent", "phone", "line_id", "email", "address", "photo_url", "photo_path", "default_rate", "portal_username", "active", "start_date", "deleted_at"],
+  courses: ["id", "org_id", "name", "description", "category_id", "level_id", "course_type", "payment_mode", "pricing_mode", "duration", "price", "total_hours", "price_per_hour", "max_students", "default_location_id", "active", "deleted_at"],
+  enrollments: ["id", "org_id", "order_id", "group_id", "course_id", "student_id", "is_new_student", "new_student_name", "new_student_phone", "total_sessions", "completed_sessions", "total_price", "paid_amount", "status", "enrolled_date", "note", "deleted_at"],
+  payments: ["id", "org_id", "order_id", "parent_payment_id", "enrollment_id", "group_id", "student_id", "amount", "total_amount", "paid_amount", "payment_date", "status", "is_group_payment", "is_sub_transaction", "note", "slip_url", "slip_path", "receipt_url", "receipt_path", "deleted_at"],
+  classes: ["id", "org_id", "student_id", "course_id", "enrollment_id", "teacher_id", "group_class_id", "class_date", "start_time", "duration_minutes", "location_id", "location_name", "status", "price", "note", "deleted_at"],
+  lesson_notes: ["id", "org_id", "student_id", "class_id", "course_id", "teacher_id", "group_note_id", "note_date", "title", "content", "duration_minutes", "deleted_at"],
+  booking_requests: ["id", "org_id", "student_id", "course_id", "requested_date", "requested_time", "duration_minutes", "location", "note", "status", "approved_class_id", "rejected_reason", "responded_at", "responded_by"],
+  categories: ["id", "org_id", "name", "color", "bg_color", "text_color", "icon", "sort_order", "active"],
+  levels: ["id", "org_id", "category_id", "name", "sort_order", "active"],
+  topics: ["id", "org_id", "category_id", "name", "active"],
+  locations: ["id", "org_id", "name", "address", "active", "sort_order"],
+  teachers: ["id", "org_id", "user_id", "name", "nickname", "email", "phone", "color", "bio", "active", "sort_order", "deleted_at"],
+};
+
+// Filter row to only allowed fields for a table
+const filterForSchema = (row, tableName) => {
+  const allowed = SCHEMA_FIELDS[tableName];
+  if (!allowed) return row;
+  // Map legacy field names to schema names BEFORE filter
+  if (tableName === "students") {
+    if (row.photo && !row.photo_url) row.photo_url = row.photo;
+    if (row.photo_path === undefined) row.photo_path = null;
+  }
+  if (tableName === "payments") {
+    if (row.slip_url === undefined && row.slipUrl) row.slip_url = row.slipUrl;
+  }
+  const out = {};
+  for (const key of allowed) {
+    if (row[key] !== undefined) out[key] = row[key];
+  }
+  return out;
+};
+
+// ============ STORAGE ABSTRACTION ============
+// Image upload — Supabase Storage (with localStorage fallback)
+// Returns: { url, path } — path is for delete later
+//
+// Usage:
+//   const { url, path } = await uploadImage(blob, 'photos', orgId, `student_${id}.webp`)
+//   await deleteImage('photos', path)
+const uploadImage = async (blob, bucket, orgId, filename) => {
+  // Use Supabase Storage if available
+  if (sb && orgId) {
+    try {
+      const path = `${orgId}/${filename}`;
+      const { error: uploadError } = await sb.storage
+        .from(bucket)
+        .upload(path, blob, {
+          contentType: blob.type || "image/webp",
+          upsert: true,
+        });
+      if (uploadError) {
+        console.error(`[uploadImage] ${bucket} upload failed:`, uploadError);
+        throw uploadError;
+      }
+      // Private bucket → use signed URL (1 year)
+      const { data: signedData, error: signError } = await sb.storage
+        .from(bucket)
+        .createSignedUrl(path, 60 * 60 * 24 * 365);
+      if (signError) throw signError;
+      return { url: signedData.signedUrl, path };
+    } catch (err) {
+      console.warn("[uploadImage] Supabase failed, falling back to base64:", err);
+      // Fall through to base64 fallback
+    }
+  }
+
+  // Fallback: base64 dataURL (localStorage)
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
-    reader.onload = (ev) => resolve(ev.target.result);
+    reader.onload = (ev) => resolve({ url: ev.target.result, path: null });
     reader.onerror = reject;
     reader.readAsDataURL(blob);
   });
+};
 
-  // === SUPABASE MODE (future) ===
-  // const ext = filename.split(".").pop() || "webp";
-  // const path = `${bucket}/${filename || `${Date.now()}.${ext}`}`;
-  // const { data, error } = await sb.storage.from(bucket).upload(path, blob, {
-  //   contentType: blob.type,
-  //   upsert: true,
-  // });
-  // if (error) throw error;
-  // const { data: urlData } = sb.storage.from(bucket).getPublicUrl(path);
-  // return urlData.publicUrl;
+// Delete image from Storage
+const deleteImage = async (bucket, path) => {
+  if (!sb || !path) return;
+  try {
+    const { error } = await sb.storage.from(bucket).remove([path]);
+    if (error) console.error(`[deleteImage] ${bucket}:`, error);
+  } catch (err) {
+    console.error("[deleteImage]", err);
+  }
+};
+
+// Refresh signed URL if expired (call before display if URL > 1 year old)
+const refreshSignedUrl = async (bucket, path) => {
+  if (!sb || !path) return null;
+  try {
+    const { data } = await sb.storage.from(bucket).createSignedUrl(path, 60 * 60 * 24 * 365);
+    return data?.signedUrl || null;
+  } catch (err) {
+    return null;
+  }
 };
 
 const KEYS = {
@@ -2043,9 +2244,11 @@ function LoginPage({ onLogin }) {
 }
 
 // ============ TEACHER ============
-function TeacherApp({ onSwitchToStudent, onLogout }) {
+function TeacherApp({ onSwitchToStudent, onLogout, session }) {
   const [tab, setTab] = useState("dashboard");
   const [sidebarOpen, setSidebarOpen] = useState(false);
+
+  // Init from localStorage cache (instant render)
   const [students, setStudents] = useState(() => load(KEYS.STUDENTS, SEED_STUDENTS));
   const [classes, setClasses] = useState(() => load(KEYS.CLASSES, SEED_CLASSES));
   const [payments, setPayments] = useState(() => load(KEYS.PAYMENTS, SEED_PAYMENTS));
@@ -2056,7 +2259,142 @@ function TeacherApp({ onSwitchToStudent, onLogout }) {
   const [bookingRequests, setBookingRequests] = useState(() => load(KEYS.BOOKING_REQUESTS, []));
   const [prefs, setPrefs] = useState(() => load(KEYS.PREFS, DEFAULT_PREFS));
   const [modal, setModal] = useState(null);
+  const [supaLoading, setSupaLoading] = useState(false);
 
+  const orgId = session?.orgId;
+
+  // === SUPABASE FETCH on mount ===
+  useEffect(() => {
+    if (!sb || !orgId) {
+      console.log("[TeacherApp] No Supabase or orgId — using localStorage only");
+      return;
+    }
+    let cancelled = false;
+    setSupaLoading(true);
+    console.log("[TeacherApp] Fetching data from Supabase for org:", orgId);
+
+    (async () => {
+      try {
+        // Fetch all transaction tables in parallel
+        const [
+          studentsData,
+          classesData,
+          paymentsData,
+          notesData,
+          coursesData,
+          enrollmentsData,
+          requestsData,
+        ] = await Promise.all([
+          supaFetchAll("students", orgId),
+          supaFetchAll("classes", orgId),
+          supaFetchAll("payments", orgId),
+          supaFetchAll("lesson_notes", orgId),
+          supaFetchAll("courses", orgId),
+          supaFetchAll("enrollments", orgId),
+          supaFetchAll("booking_requests", orgId),
+        ]);
+
+        if (cancelled) return;
+
+        // Replace local state with Supabase data
+        if (studentsData !== null) { setStudents(studentsData); save(KEYS.STUDENTS, studentsData); }
+        if (classesData !== null) { setClasses(classesData); save(KEYS.CLASSES, classesData); }
+        if (paymentsData !== null) { setPayments(paymentsData); save(KEYS.PAYMENTS, paymentsData); }
+        if (notesData !== null) { setNotes(notesData); save(KEYS.NOTES, notesData); }
+        if (coursesData !== null) { setCourses(coursesData); save(KEYS.COURSES, coursesData); }
+        if (enrollmentsData !== null) { setEnrollments(enrollmentsData); save(KEYS.ENROLLMENTS, enrollmentsData); }
+        if (requestsData !== null) { setBookingRequests(requestsData); save(KEYS.BOOKING_REQUESTS, requestsData); }
+
+        // Fetch master data (categories, levels, topics, locations, teachers) → settings
+        const [cats, lvls, tps, locs, tchs] = await Promise.all([
+          supaFetchAll("categories", orgId),
+          supaFetchAll("levels", orgId),
+          supaFetchAll("topics", orgId),
+          supaFetchAll("locations", orgId),
+          supaFetchAll("teachers", orgId),
+        ]);
+
+        if (cancelled) return;
+
+        const newSettings = {
+          ...settings,
+          categories: cats || settings.categories,
+          levels: lvls || settings.levels,
+          topics: tps || settings.topics,
+          locations: locs || settings.locations,
+          teachers: tchs || settings.teachers,
+        };
+        setSettings(newSettings);
+        save(KEYS.SETTINGS, newSettings);
+
+        console.log("[TeacherApp] Supabase data loaded successfully");
+      } catch (err) {
+        console.error("[TeacherApp] Supabase fetch failed:", err);
+      } finally {
+        if (!cancelled) setSupaLoading(false);
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [orgId]);
+
+  // === REAL-TIME SUBSCRIPTIONS — multi-device sync ===
+  useEffect(() => {
+    if (!sb || !orgId) return;
+
+    // Helper: handle realtime payload for a table → update local state
+    const handleRealtime = (setter, payload) => {
+      const { eventType, new: newRow, old: oldRow } = payload;
+      if (eventType === "INSERT" && newRow) {
+        const camel = camelize(newRow);
+        setter(prev => {
+          if (prev.some(x => x.id === camel.id)) return prev; // skip duplicates from own changes
+          return [camel, ...prev];
+        });
+      } else if (eventType === "UPDATE" && newRow) {
+        const camel = camelize(newRow);
+        // If soft-deleted, remove from list
+        if (camel.deletedAt) {
+          setter(prev => prev.filter(x => x.id !== camel.id));
+        } else {
+          setter(prev => prev.map(x => x.id === camel.id ? camel : x));
+        }
+      } else if (eventType === "DELETE" && oldRow) {
+        setter(prev => prev.filter(x => x.id !== oldRow.id));
+      }
+    };
+
+    const channel = sb
+      .channel(`org-${orgId}`)
+      .on("postgres_changes",
+        { event: "*", schema: "public", table: "students", filter: `org_id=eq.${orgId}` },
+        (p) => handleRealtime(setStudents, p))
+      .on("postgres_changes",
+        { event: "*", schema: "public", table: "classes", filter: `org_id=eq.${orgId}` },
+        (p) => handleRealtime(setClasses, p))
+      .on("postgres_changes",
+        { event: "*", schema: "public", table: "payments", filter: `org_id=eq.${orgId}` },
+        (p) => handleRealtime(setPayments, p))
+      .on("postgres_changes",
+        { event: "*", schema: "public", table: "lesson_notes", filter: `org_id=eq.${orgId}` },
+        (p) => handleRealtime(setNotes, p))
+      .on("postgres_changes",
+        { event: "*", schema: "public", table: "courses", filter: `org_id=eq.${orgId}` },
+        (p) => handleRealtime(setCourses, p))
+      .on("postgres_changes",
+        { event: "*", schema: "public", table: "enrollments", filter: `org_id=eq.${orgId}` },
+        (p) => handleRealtime(setEnrollments, p))
+      .on("postgres_changes",
+        { event: "*", schema: "public", table: "booking_requests", filter: `org_id=eq.${orgId}` },
+        (p) => handleRealtime(setBookingRequests, p))
+      .subscribe((status) => {
+        if (status === "SUBSCRIBED") console.log("[realtime] connected");
+      });
+
+    return () => { sb.removeChannel(channel); };
+  }, [orgId]);
+
+  // === Save to localStorage (cache) — same as before ===
   useEffect(() => save(KEYS.STUDENTS, students), [students]);
   useEffect(() => save(KEYS.CLASSES, classes), [classes]);
   useEffect(() => save(KEYS.PAYMENTS, payments), [payments]);
@@ -2070,10 +2408,49 @@ function TeacherApp({ onSwitchToStudent, onLogout }) {
     document.documentElement.setAttribute("data-theme", prefs.theme);
   }, [prefs]);
 
-  const t = (key) => I18N[prefs.lang]?.[key] || I18N.th[key] || key;
-  const teacherName = (settings?.teachers || DEFAULT_SETTINGS.teachers || [])[0]?.name || "ครูสมชาย";
+  // === Sync changes to Supabase (debounced via prev ref) ===
+  const prevDataRef = useRef({});
+  useEffect(() => {
+    if (!sb || !orgId || supaLoading) return;
+    // Skip first render (data just loaded)
+    if (!prevDataRef.current.initialized) {
+      prevDataRef.current = {
+        students, classes, payments, notes, courses, enrollments, bookingRequests,
+        cats: settings.categories, lvls: settings.levels, tps: settings.topics,
+        locs: settings.locations, tchs: settings.teachers,
+        initialized: true,
+      };
+      return;
+    }
+    // Sync each table that changed
+    const prev = prevDataRef.current;
+    if (prev.students !== students) supaSync("students", prev.students, students, orgId);
+    if (prev.classes !== classes) supaSync("classes", prev.classes, classes, orgId);
+    if (prev.payments !== payments) supaSync("payments", prev.payments, payments, orgId);
+    if (prev.notes !== notes) supaSync("lesson_notes", prev.notes, notes, orgId);
+    if (prev.courses !== courses) supaSync("courses", prev.courses, courses, orgId);
+    if (prev.enrollments !== enrollments) supaSync("enrollments", prev.enrollments, enrollments, orgId);
+    if (prev.bookingRequests !== bookingRequests) supaSync("booking_requests", prev.bookingRequests, bookingRequests, orgId);
 
-  const ctx = { students, setStudents, classes, setClasses, payments, setPayments, notes, setNotes, courses, setCourses, enrollments, setEnrollments, settings, setSettings, bookingRequests, setBookingRequests, prefs, setPrefs, t, teacherName, setModal };
+    // Master data — sync if changed
+    if (prev.cats !== settings.categories) supaSync("categories", prev.cats, settings.categories, orgId);
+    if (prev.lvls !== settings.levels) supaSync("levels", prev.lvls, settings.levels, orgId);
+    if (prev.tps !== settings.topics) supaSync("topics", prev.tps, settings.topics, orgId);
+    if (prev.locs !== settings.locations) supaSync("locations", prev.locs, settings.locations, orgId);
+    if (prev.tchs !== settings.teachers) supaSync("teachers", prev.tchs, settings.teachers, orgId);
+
+    prevDataRef.current = {
+      students, classes, payments, notes, courses, enrollments, bookingRequests,
+      cats: settings.categories, lvls: settings.levels, tps: settings.topics,
+      locs: settings.locations, tchs: settings.teachers,
+      initialized: true,
+    };
+  }, [students, classes, payments, notes, courses, enrollments, bookingRequests, settings, orgId, supaLoading]);
+
+  const t = (key) => I18N[prefs.lang]?.[key] || I18N.th[key] || key;
+  const teacherName = session?.name || (settings?.teachers || DEFAULT_SETTINGS.teachers || [])[0]?.name || "ครู";
+
+  const ctx = { students, setStudents, classes, setClasses, payments, setPayments, notes, setNotes, courses, setCourses, enrollments, setEnrollments, settings, setSettings, bookingRequests, setBookingRequests, prefs, setPrefs, t, teacherName, setModal, session, orgId };
 
   const pendingReqCount = bookingRequests.filter(r => r.status === "pending").length;
 
@@ -3900,7 +4277,7 @@ function SellCourseModal({ ctx, onClose, course, onNavigate }) {
           : 0; // group-total: paid only goes to first student record
 
         enrollmentsList.push({
-          id: `en${Date.now()}_${idx}`,
+          id: newId(),
           courseId: course.id,
           studentId: stId,
           groupId, // link enrollments together
@@ -3920,7 +4297,7 @@ function SellCourseModal({ ctx, onClose, course, onNavigate }) {
         // Payment record per student
         if (course.paymentMode === "per-student") {
           paymentsList.push({
-            id: `p${Date.now()}_${idx}`,
+            id: newId(),
             orderId: `${orderId}-${idx + 1}`, // sub-order per student
             studentId: stId,
             amount: perStudentPaid,
@@ -3939,7 +4316,7 @@ function SellCourseModal({ ctx, onClose, course, onNavigate }) {
       if (course.paymentMode === "group-total" && enrollmentsList.length > 0) {
         const firstStId = enrollmentsList[0].studentId;
         paymentsList.push({
-          id: `p${Date.now()}`,
+          id: newId(),
           orderId,
           studentId: firstStId,
           amount: paidAmount,
@@ -3984,7 +4361,7 @@ function SellCourseModal({ ctx, onClose, course, onNavigate }) {
 
     const orderId = nextOrderId();
     const enrollment = {
-      id: `en${Date.now()}`,
+      id: newId(),
       courseId: course.id,
       studentId: finalStudentId,
       orderId,
@@ -4003,7 +4380,7 @@ function SellCourseModal({ ctx, onClose, course, onNavigate }) {
 
     const remaining = totalPrice - paidAmount;
     setPayments(prev => [...prev, {
-      id: `p${Date.now()}`,
+      id: newId(),
       orderId,
       studentId: finalStudentId,
       amount: paidAmount,
@@ -5492,7 +5869,7 @@ function PaymentsPage({ ctx, onOpen }) {
               // เพิ่ม _txRecord ใหม่สำหรับการรับเงินครั้งนี้
               if (paidAmt > 0) {
                 updated.push({
-                  id: `p${Date.now()}`,
+                  id: newId(),
                   studentId: receiveModal.studentId,
                   amount: paidAmt,
                   totalAmount: total,
@@ -5692,7 +6069,7 @@ function SettingsPage({ ctx }) {
   const addLocation = () => {
     setSettings(s => ({
       ...s,
-      locations: [...(s.locations || []), { id: `loc${Date.now()}`, name: "สถานที่ใหม่", icon: "📍", active: true }],
+      locations: [...(s.locations || []), { id: newId(), name: "สถานที่ใหม่", icon: "📍", active: true }],
     }));
   };
   const updateLocation = (id, field, val) => {
@@ -5729,7 +6106,7 @@ function SettingsPage({ ctx }) {
     setSettings(s => ({ ...s, levels: s.levels.map(l => l.id === id ? { ...l, [field]: val } : l) }));
 
   const addCat = () => {
-    const newCat = { id: `cat${Date.now()}`, name: "หมวดหมู่ใหม่", color: "var(--text-tertiary)", bg: "var(--bg-muted)", text: "var(--text-primary)", active: true };
+    const newCat = { id: newId(), name: "หมวดหมู่ใหม่", color: "var(--text-tertiary)", bg: "var(--bg-muted)", text: "var(--text-primary)", active: true };
     setSettings(s => ({ ...s, categories: [...s.categories, newCat] }));
   };
   const removeCat = (id) => {
@@ -5743,7 +6120,7 @@ function SettingsPage({ ctx }) {
     setSettings(s => ({ ...s, categories: s.categories.filter(c => c.id !== id) }));
   };
   const addLvl = () => {
-    const newLvl = { id: `lv${Date.now()}`, name: "ระดับใหม่", desc: "", active: true };
+    const newLvl = { id: newId(), name: "ระดับใหม่", desc: "", active: true };
     setSettings(s => ({ ...s, levels: [...s.levels, newLvl] }));
   };
   const removeLvl = (id) => {
@@ -5762,7 +6139,7 @@ function SettingsPage({ ctx }) {
     setSettings(s => {
       const lbc = s.levelsByCategory || {};
       const arr = lbc[catId] || [];
-      return { ...s, levelsByCategory: { ...lbc, [catId]: [...arr, { id: `lv${Date.now()}`, name: "ระดับใหม่", desc: "", active: true }] } };
+      return { ...s, levelsByCategory: { ...lbc, [catId]: [...arr, { id: newId(), name: "ระดับใหม่", desc: "", active: true }] } };
     });
   };
   const updateCatLevel = (catId, idx, field, val) => {
@@ -6402,7 +6779,7 @@ function SettingsPage({ ctx }) {
                   setSettings(s => ({
                     ...s,
                     teachers: [...(s.teachers || []), {
-                      id: `t${Date.now()}`,
+                      id: newId(),
                       ...tForm,
                       active: true,
                     }],
@@ -7694,9 +8071,22 @@ function StudentForm({ ctx, onClose, existing }) {
       return;
     }
     try {
-      // Square crop friendly: 600x600 for student avatar
+      // Square crop friendly: 400x400 for student avatar
       const result = await processImage(file, { maxWidth: 400, maxHeight: 400, quality: 0.75, targetKB: 20 });
+      // Show preview immediately
       setForm(f => ({ ...f, photo: result.dataUrl }));
+      // Upload to Storage in background (if Supabase available)
+      if (sb && ctx.orgId) {
+        const studentId = existing?.id || form.id || newId();
+        const filename = `student_${studentId}.webp`;
+        try {
+          const { url, path } = await uploadImage(result.blob, "photos", ctx.orgId, filename);
+          setForm(f => ({ ...f, id: studentId, photo: url, photoPath: path }));
+        } catch (err) {
+          console.warn("[photo] Storage upload failed, using base64:", err);
+          // Keep base64 as fallback
+        }
+      }
     } catch (err) {
       console.error("Photo processing failed:", err);
       alert("ไม่สามารถประมวลผลรูปได้ — ลองรูปอื่น");
@@ -8797,7 +9187,7 @@ function BookingPage({ ctx, onNavigate }) {
 
       const hrs = Number(duration) / 60;
       const newClasses = selectedGroup.enrollments.map((en, idx) => ({
-        id: `c${Date.now()}_${idx}`,
+        id: newId(),
         studentId: en.studentId,
         courseId: selectedGroup.courseId,
         teacherId: teacherId || undefined,
@@ -9771,7 +10161,7 @@ function QuickNoteModal({ booking, ctx, onClose }) {
       // Group booking: create 1 note per student in the group
       const groupClasses = classes.filter(c => c.groupClassId === booking.groupClassId);
       const newNotes = groupClasses.map((gc, idx) => ({
-        id: `n${Date.now()}_${idx}`,
+        id: newId(),
         studentId: gc.studentId,
         classId: gc.id,
         date: gc.date,
@@ -9786,7 +10176,7 @@ function QuickNoteModal({ booking, ctx, onClose }) {
       }
     } else {
       setNotes(prev => [{
-        id: `n${Date.now()}`,
+        id: newId(),
         studentId: booking.studentId,
         classId: booking.id,
         date: booking.date,
@@ -10022,7 +10412,7 @@ function BookingModal({ ctx, onClose, onNavigate }) {
 
   const confirm = () => {
     const newClass = {
-      id: `c${Date.now()}`,
+      id: newId(),
       studentId: selectedStudentId,
       courseId: selectedCourseId || undefined,
       date,
@@ -10328,7 +10718,7 @@ function PaymentForm({ ctx, onClose }) {
 
   const submit = () => {
     if (!form.studentId || !form.amount) return alert("กรุณาเลือกนักเรียนและกรอกยอด");
-    setPayments(prev => [...prev, { ...form, id: `p${Date.now()}`, amount: Number(form.amount) }]);
+    setPayments(prev => [...prev, { ...form, id: newId(), amount: Number(form.amount) }]);
     onClose();
   };
 
@@ -10484,7 +10874,7 @@ function NoteForm({ ctx, onClose, prefill }) {
       // Create 1 note per student in group, share groupNoteId
       const groupNoteId = `gn${Date.now()}`;
       const newNotes = classInfo.members.map((m, idx) => ({
-        id: `n${Date.now()}_${idx}`,
+        id: newId(),
         studentId: m.studentId,
         courseId: classInfo.course?.id || "",
         classId: m.id,
@@ -10496,7 +10886,7 @@ function NoteForm({ ctx, onClose, prefill }) {
       setNotes(prev => [...newNotes, ...prev]);
     } else {
       setNotes(prev => [{
-        id: `n${Date.now()}`,
+        id: newId(),
         studentId: selectedClass.studentId,
         courseId: selectedClass.courseId || "",
         classId: selectedClass.id,
@@ -11391,7 +11781,7 @@ function StudentBookingForm({ student, studentId, courses, classes, enrollments,
       return;
     }
     const newReq = {
-      id: `req${Date.now()}`,
+      id: newId(),
       studentId,
       courseId: courseId || null,
       requestedDate,
