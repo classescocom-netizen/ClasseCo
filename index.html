@@ -347,8 +347,11 @@
     .grid-cols-3-resp { grid-template-columns: 1fr !important; }
     .grid-cols-4-resp { grid-template-columns: 1fr 1fr !important; }
 
-    /* Stat cards stack */
+    /* Stat cards — 2 columns on tablet, 1 column on phone */
     .stat-grid-resp { grid-template-columns: 1fr 1fr !important; gap: 1px !important; }
+
+    /* Courses & generic 2-col grids — stack on mobile */
+    .grid-cols-2 { grid-template-columns: 1fr !important; }
 
     /* Tables — make horizontally scrollable */
     .table-scroll {
@@ -456,7 +459,7 @@
     }
   }
 
-  @media (max-width: 480px) {
+  @media (max-width: 600px) {
     .grid-cols-4-resp { grid-template-columns: 1fr !important; }
     .stat-grid-resp { grid-template-columns: 1fr !important; }
     .num-display { font-size: 22px !important; }
@@ -3648,7 +3651,7 @@ function CoursesPage({ ctx, onOpen }) {
 
   return (
     <div className="responsive-page-pad p-8 space-y-5">
-      <div className="grid grid-cols-4" style={{ background: "var(--bg-surface)", border: "0.5px solid var(--border-soft)" }}>
+      <div className="grid grid-cols-4 stat-grid-resp" style={{ background: "var(--bg-surface)", border: "0.5px solid var(--border-soft)" }}>
         <StatCard label="คอร์สทั้งหมด" value={courses.length} trend={`${courses.filter(c => c.active).length} เปิดรับอยู่`} up />
         <StatCard label="กำลังเรียนอยู่" value={activeEnrollments} trend="การลงทะเบียน active" up />
         <StatCard label="รายได้จากคอร์ส" value={formatBaht(totalRevenue)} trend="ยอดรวมที่รับแล้ว" up />
@@ -5916,7 +5919,7 @@ function PaymentsPage({ ctx, onOpen }) {
   return (
     <div className="responsive-page-pad p-8 space-y-5">
       {/* Stat cards */}
-      <div className="grid grid-cols-3" style={{ background: "var(--bg-surface)", border: "0.5px solid var(--border-soft)" }}>
+      <div className="grid grid-cols-3 stat-grid-resp" style={{ background: "var(--bg-surface)", border: "0.5px solid var(--border-soft)" }}>
         <StatCard label={t("paidThisMonth")} value={formatBaht(totalPaidMonth)} trend={t("monthRevenue")} up />
         <StatCard label={t("unpaidAmount")} value={formatBaht(totalUnpaid)} trend={`${payments.filter(isUnpaid).length} ${t("record")}`} up={false} />
         <StatCard label={t("partialPaid")} value={formatBaht(totalPartial)} trend={`${payments.filter(p => p.status === "partial").length} ${t("record")}`} up={false} />
@@ -7816,7 +7819,7 @@ ${recentComments || "(ยังไม่มีบันทึก)"}
           </div>
 
           {/* Overview stats */}
-          <div className="grid grid-cols-4" style={{ background: "var(--bg-surface)", border: "0.5px solid var(--border-soft)" }}>
+          <div className="grid grid-cols-4 stat-grid-resp" style={{ background: "var(--bg-surface)", border: "0.5px solid var(--border-soft)" }}>
             <StatCard label="คลาสที่สอนแล้ว" value={completedClasses.length} trend={`${studentClasses.length - completedClasses.length} รอสอน`} />
             <StatCard label="ชั่วโมงรวม" value={`${totalHours.toFixed(1)}h`} trend={`เฉลี่ย ${completedClasses.length > 0 ? (totalHours / completedClasses.length * 60).toFixed(0) : 0} นาที/คลาส`} up />
             <StatCard label="หัวข้อที่เรียน" value={topicStats.length} trend={topTopic ? `นิยม: ${topTopic.topic}` : "—"} />
@@ -8093,7 +8096,7 @@ ${recentComments || "(ยังไม่มีบันทึก)"}
             </div>
 
             {/* Stats strip */}
-            <div className="grid grid-cols-3" style={{ background: "#1A1A17", color: "#E8E4D6" }}>
+            <div className="grid grid-cols-3 stat-grid-resp" style={{ background: "#1A1A17", color: "#E8E4D6" }}>
               <div className="py-4 text-center" style={{ borderRight: "0.5px solid rgba(232,228,214,0.1)" }}>
                 <div className="num-display text-[22px]" style={{ color: "#C4A878" }}>{completedClasses.length}</div>
                 <div className="text-[9px] mt-0.5 label-eyebrow" style={{ color: "rgba(232,228,214,0.5)" }}>Classes</div>
@@ -8552,7 +8555,7 @@ function StudentDetail({ student, ctx, onClose }) {
         <div className="p-6 space-y-5">
 
           {/* Stats */}
-          <div className="grid grid-cols-4" style={{ background: "var(--bg-muted)", border: "0.5px solid var(--border-soft)" }}>
+          <div className="grid grid-cols-4 stat-grid-resp" style={{ background: "var(--bg-muted)", border: "0.5px solid var(--border-soft)" }}>
             <StatCard compact label="คลาสรวม" value={completed} />
             <StatCard compact label="ได้รับแล้ว" value={formatBaht(totalPaid)} up />
             <StatCard compact label="ค้างชำระ" value={formatBaht(pending)} up={pending === 0} />
@@ -9716,26 +9719,26 @@ function BookingPage({ ctx, onNavigate }) {
           {bookingMode === "individual" && (
           <div>
             <div className="label-eyebrow mb-2">คอร์สที่ลงทะเบียน</div>
+            <div className="space-y-1.5">
+              <button onClick={() => setSelectedCourseId("")}
+                className="w-full flex items-center gap-3 px-3 py-2.5 text-left transition-all"
+                style={{
+                  background: !selectedCourseId ? "var(--bg-muted)" : "transparent",
+                  border: !selectedCourseId ? "0.5px solid var(--border-default)" : "0.5px solid transparent",
+                }}>
+                <div className="w-7 h-7 flex items-center justify-center flex-shrink-0" style={{ background: "var(--bg-muted)" }}>
+                  <span className="text-[14px]" style={{ color: "var(--text-tertiary)" }}>—</span>
+                </div>
+                <div className="text-[12px]" style={{ color: "var(--text-tertiary)" }}>ไม่ระบุคอร์ส (จองเวลาว่าง)</div>
+                {!selectedCourseId && <IconCheck size={12} style={{ color: "var(--text-tertiary)", marginLeft: "auto" }} />}
+              </button>
+
             {studentEnrollments.length === 0 ? (
-              <div className="px-4 py-3 text-[12px]" style={{ background: "var(--bg-muted)", color: "var(--text-tertiary)", borderLeft: "3px solid var(--border-default)" }}>
-                นักเรียนคนนี้ยังไม่ได้ลงทะเบียนคอร์สใด
-                <div className="text-[10px] mt-0.5" style={{ color: "var(--text-quaternary)" }}>ไปที่ คอร์สเรียน → ขายคอร์สนี้ เพื่อลงทะเบียน</div>
+              <div className="px-3 py-2 text-[11px] mt-2" style={{ background: "var(--bg-muted)", color: "var(--text-tertiary)", borderLeft: "3px solid var(--border-default)" }}>
+                💡 นักเรียนยังไม่มีคอร์ส — จองเวลาเรียนได้เลย หรือไปที่ <strong>คอร์สเรียน → ขายคอร์สนี้</strong> เพื่อลงทะเบียน
               </div>
             ) : (
-              <div className="space-y-1.5">
-                <button onClick={() => setSelectedCourseId("")}
-                  className="w-full flex items-center gap-3 px-3 py-2.5 text-left transition-all"
-                  style={{
-                    background: !selectedCourseId ? "var(--bg-muted)" : "transparent",
-                    border: !selectedCourseId ? "0.5px solid var(--border-default)" : "0.5px solid transparent",
-                  }}>
-                  <div className="w-7 h-7 flex items-center justify-center flex-shrink-0" style={{ background: "var(--bg-muted)" }}>
-                    <span className="text-[14px]" style={{ color: "var(--text-tertiary)" }}>—</span>
-                  </div>
-                  <div className="text-[12px]" style={{ color: "var(--text-tertiary)" }}>ไม่ระบุคอร์ส</div>
-                  {!selectedCourseId && <IconCheck size={12} style={{ color: "var(--text-tertiary)", marginLeft: "auto" }} />}
-                </button>
-
+              <>
                 {studentEnrollments.map(en => {
                   const c = courses.find(cc => cc.id === en.courseId);
                   if (!c) return null;
@@ -9778,8 +9781,9 @@ function BookingPage({ ctx, onNavigate }) {
                     </button>
                   );
                 })}
-              </div>
+              </>
             )}
+            </div>
           </div>
           )}
 
