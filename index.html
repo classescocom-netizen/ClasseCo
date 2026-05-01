@@ -2,7 +2,7 @@
 <html lang="th">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
 <title>ClassesCo — ระบบครูสอนพิเศษ</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -172,6 +172,25 @@
   }
   @media (max-width: 640px) {
     .login-shell { padding: 24px 16px; }
+  }
+
+  /* iOS Safari auto-zooms inputs with font-size < 16px on focus.
+     Use very high specificity to beat Tailwind arbitrary classes.
+     Apply to ALL screen widths to prevent zoom on iPad too. */
+  html body input,
+  html body select,
+  html body textarea {
+    font-size: 16px !important;
+  }
+  /* Restore intentionally small text inside specific inline-styled inputs
+     for desktop only — but on touch devices keep 16px to prevent zoom */
+  @media (hover: hover) and (pointer: fine) {
+    /* Desktop only — allow inline font-size styles */
+    html body input[style*="font-size"],
+    html body select[style*="font-size"],
+    html body textarea[style*="font-size"] {
+      font-size: inherit !important;
+    }
   }
 
   /* Decorative ornament divider — for soft premium sections */
