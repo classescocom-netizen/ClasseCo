@@ -293,6 +293,9 @@
   }
 
   /* === MOBILE: under 768px === */
+  /* Mobile-only visibility utility */
+  .show-mobile-block { display: none; }
+
   @media (max-width: 768px) {
     /* Sidebar becomes drawer */
     .sidebar-drawer {
@@ -361,9 +364,13 @@
     .table-scroll > div {
       min-width: 720px;
     }
+    /* Payments page — instead of horizontal scroll, hide some columns */
+    .payments-table > div { min-width: 0 !important; }
 
     /* Hide certain columns on mobile */
     .hide-mobile { display: none !important; }
+    .hide-mobile-block { display: none !important; }
+    .show-mobile-block { display: block !important; }
 
     /* Compact filters */
     .filter-pill {
@@ -5942,7 +5949,7 @@ function PaymentsPage({ ctx, onOpen }) {
 
       {/* Accordion table */}
       <div className="table-scroll" style={{ background: "var(--bg-surface)", border: "0.5px solid var(--border-soft)", overflow: "hidden" }}>
-       <div style={{ minWidth: 720 }}>
+       <div style={{ minWidth: 720 }} className="hide-mobile-block">
         {/* Header row */}
         <div className="grid text-[9px] font-medium px-4 py-2.5 label-eyebrow"
           style={{ gridTemplateColumns: COLS, background: "var(--bg-muted)", borderBottom: "0.5px solid var(--border-soft)" }}>
@@ -6108,9 +6115,83 @@ function PaymentsPage({ ctx, onOpen }) {
           );
         })}
        </div>
-      </div>
 
-      {/* Slip Lightbox */}
+       {/* Mobile-only: card layout */}
+       <div className="show-mobile-block">
+        {groups.length === 0 && (
+          <div className="p-12 text-center heading-serif text-[18px] italic" style={{ color: "var(--text-tertiary)" }}>ไม่มีรายการ</div>
+        )}
+        {groups.map(g => {
+          const s = students.find(st => st.id === g.studentId);
+          const sc = statusChip(g.status);
+          return (
+            <div key={g.key} className="px-4 py-3.5" style={{ borderBottom: "0.5px solid var(--border-soft)" }}>
+              {/* Header: student + status */}
+              <div className="flex items-start gap-3 mb-3">
+                <div className="w-9 h-9 rounded-full flex items-center justify-center text-[13px] font-semibold flex-shrink-0"
+                  style={{ background: "var(--bg-muted)", color: "var(--text-secondary)" }}>
+                  {s?.name?.charAt(0) || "?"}
+                </div>
+                <div className="flex-1 min-w-0">
+                  <div className="text-[14px] font-medium flex items-baseline gap-1.5">
+                    <span className="truncate">{s?.name || "—"}</span>
+                    {s?.nickname && <span className="text-[11px] italic flex-shrink-0" style={{ color: "var(--text-tertiary)" }}>"{s.nickname}"</span>}
+                  </div>
+                  <div className="text-[11px] truncate" style={{ color: "var(--text-secondary)" }}>{g.note}</div>
+                  <div className="font-mono text-[10px] mt-0.5" style={{ color: "var(--text-quaternary)" }}>{g.payments[0]?.orderId || "—"}</div>
+                </div>
+                <span className="text-[10px] px-2 py-0.5 font-medium flex-shrink-0" style={{ background: sc.bg, color: sc.fg }}>{sc.label}</span>
+              </div>
+
+              {/* Amounts: 3 columns */}
+              <div className="grid grid-cols-3 gap-2 mb-3" style={{ background: "var(--bg-muted)", padding: 10 }}>
+                <div>
+                  <div className="text-[9px] label-eyebrow" style={{ color: "var(--text-tertiary)" }}>รวม</div>
+                  <div className="num-display text-[14px]">{formatBaht(g.totalAmt)}</div>
+                </div>
+                <div>
+                  <div className="text-[9px] label-eyebrow" style={{ color: "var(--text-tertiary)" }}>ชำระแล้ว</div>
+                  <div className="num-display text-[14px]" style={{ color: g.paidAmt > 0 ? "var(--success)" : "var(--text-tertiary)" }}>
+                    {g.paidAmt > 0 ? formatBaht(g.paidAmt) : "—"}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-[9px] label-eyebrow" style={{ color: "var(--text-tertiary)" }}>ค้าง</div>
+                  <div className="num-display text-[14px]" style={{ color: g.remaining > 0 ? "var(--danger)" : "var(--text-tertiary)" }}>
+                    {g.remaining > 0 ? formatBaht(g.remaining) : "—"}
+                  </div>
+                </div>
+              </div>
+
+              {/* Actions */}
+              <div className="flex gap-2">
+                {g.remaining > 0 && (
+                  <button onClick={() => {
+                    const parent = g.payments[0];
+                    setReceiveModal({
+                      ...parent,
+                      totalAmount: g.totalAmt,
+                      paidAmount: g.paidAmt,
+                      _groupNote: g.note,
+                      _realParentId: parent.id,
+                    });
+                  }}
+                    className="flex-1 text-[12px] px-3 py-2 font-medium flex items-center justify-center gap-1.5"
+                    style={{ background: "#1A1A17", color: "#C4A878" }}>
+                    <IconCheck size={11} /> รับเงิน
+                  </button>
+                )}
+                <button onClick={() => exportSlipPDF(g, students, ctx.teacherName)}
+                  className="text-[12px] px-3 py-2 flex items-center gap-1.5"
+                  style={{ border: "0.5px solid var(--border-default)", color: "var(--text-secondary)" }}>
+                  <IconBook size={11} /> Slip
+                </button>
+              </div>
+            </div>
+          );
+        })}
+       </div>
+      </div>
       {slipModal && (
         <div className="fixed inset-0 z-[60] flex items-center justify-center fade-in"
           style={{ background: "rgba(0,0,0,0.85)", backdropFilter: "blur(4px)" }}
