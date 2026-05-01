@@ -2390,6 +2390,7 @@ function TeacherApp({ onSwitchToStudent, onLogout, session }) {
   }, []);
 
   const orgId = session?.orgId;
+  const prevDataRef = useRef({});
 
   // === SUPABASE FETCH on mount ===
   useEffect(() => {
@@ -2400,6 +2401,7 @@ function TeacherApp({ onSwitchToStudent, onLogout, session }) {
     let cancelled = false;
     setSupaLoading(true);
     console.log("[TeacherApp] Fetching data from Supabase for org:", orgId);
+    setSyncState({ state: "syncing", message: "Loading from Supabase..." });
 
     (async () => {
       try {
@@ -2425,13 +2427,21 @@ function TeacherApp({ onSwitchToStudent, onLogout, session }) {
         if (cancelled) return;
 
         // Replace local state with Supabase data
-        if (studentsData !== null) { setStudents(studentsData); save(KEYS.STUDENTS, studentsData); }
-        if (classesData !== null) { setClasses(classesData); save(KEYS.CLASSES, classesData); }
-        if (paymentsData !== null) { setPayments(paymentsData); save(KEYS.PAYMENTS, paymentsData); }
-        if (notesData !== null) { setNotes(notesData); save(KEYS.NOTES, notesData); }
-        if (coursesData !== null) { setCourses(coursesData); save(KEYS.COURSES, coursesData); }
-        if (enrollmentsData !== null) { setEnrollments(enrollmentsData); save(KEYS.ENROLLMENTS, enrollmentsData); }
-        if (requestsData !== null) { setBookingRequests(requestsData); save(KEYS.BOOKING_REQUESTS, requestsData); }
+        const _students = studentsData !== null ? studentsData : students;
+        const _classes = classesData !== null ? classesData : classes;
+        const _payments = paymentsData !== null ? paymentsData : payments;
+        const _notes = notesData !== null ? notesData : notes;
+        const _courses = coursesData !== null ? coursesData : courses;
+        const _enrollments = enrollmentsData !== null ? enrollmentsData : enrollments;
+        const _requests = requestsData !== null ? requestsData : bookingRequests;
+
+        if (studentsData !== null) { setStudents(_students); save(KEYS.STUDENTS, _students); }
+        if (classesData !== null) { setClasses(_classes); save(KEYS.CLASSES, _classes); }
+        if (paymentsData !== null) { setPayments(_payments); save(KEYS.PAYMENTS, _payments); }
+        if (notesData !== null) { setNotes(_notes); save(KEYS.NOTES, _notes); }
+        if (coursesData !== null) { setCourses(_courses); save(KEYS.COURSES, _courses); }
+        if (enrollmentsData !== null) { setEnrollments(_enrollments); save(KEYS.ENROLLMENTS, _enrollments); }
+        if (requestsData !== null) { setBookingRequests(_requests); save(KEYS.BOOKING_REQUESTS, _requests); }
 
         // Fetch master data (categories, levels, topics, locations, teachers) → settings
         const [cats, lvls, tps, locs, tchs] = await Promise.all([
@@ -2444,20 +2454,41 @@ function TeacherApp({ onSwitchToStudent, onLogout, session }) {
 
         if (cancelled) return;
 
+        const _cats = cats || settings.categories;
+        const _lvls = lvls || settings.levels;
+        const _tps = tps || settings.topics;
+        const _locs = locs || settings.locations;
+        const _tchs = tchs || settings.teachers;
+
         const newSettings = {
           ...settings,
-          categories: cats || settings.categories,
-          levels: lvls || settings.levels,
-          topics: tps || settings.topics,
-          locations: locs || settings.locations,
-          teachers: tchs || settings.teachers,
+          categories: _cats,
+          levels: _lvls,
+          topics: _tps,
+          locations: _locs,
+          teachers: _tchs,
         };
         setSettings(newSettings);
         save(KEYS.SETTINGS, newSettings);
 
+        // Pre-populate prevDataRef with FETCHED data so sync compares correctly
+        prevDataRef.current = {
+          students: _students,
+          classes: _classes,
+          payments: _payments,
+          notes: _notes,
+          courses: _courses,
+          enrollments: _enrollments,
+          bookingRequests: _requests,
+          cats: _cats, lvls: _lvls, tps: _tps, locs: _locs, tchs: _tchs,
+          initialized: true,
+        };
+
         console.log("[TeacherApp] Supabase data loaded successfully");
+        setSyncState({ state: "synced", lastSyncAt: new Date(), message: "✓ Loaded from Supabase" });
       } catch (err) {
         console.error("[TeacherApp] Supabase fetch failed:", err);
+        setSyncState({ state: "error", lastError: err.message, message: `❌ Load failed: ${err.message}` });
       } finally {
         if (!cancelled) setSupaLoading(false);
       }
@@ -2470,25 +2501,39 @@ function TeacherApp({ onSwitchToStudent, onLogout, session }) {
   useEffect(() => {
     if (!sb || !orgId) return;
 
-    // Helper: handle realtime payload for a table → update local state
-    const handleRealtime = (setter, payload) => {
+    // Helper: handle realtime payload for a table → update local state + prevRef
+    // Updating prevRef prevents the sync effect from re-uploading what we just received
+    const handleRealtime = (key, setter, payload) => {
       const { eventType, new: newRow, old: oldRow } = payload;
       if (eventType === "INSERT" && newRow) {
         const camel = camelize(newRow);
         setter(prev => {
-          if (prev.some(x => x.id === camel.id)) return prev; // skip duplicates from own changes
-          return [camel, ...prev];
+          if (prev.some(x => x.id === camel.id)) return prev;
+          const next = [camel, ...prev];
+          if (prevDataRef.current.initialized) prevDataRef.current[key] = next;
+          return next;
         });
       } else if (eventType === "UPDATE" && newRow) {
         const camel = camelize(newRow);
-        // If soft-deleted, remove from list
         if (camel.deletedAt) {
-          setter(prev => prev.filter(x => x.id !== camel.id));
+          setter(prev => {
+            const next = prev.filter(x => x.id !== camel.id);
+            if (prevDataRef.current.initialized) prevDataRef.current[key] = next;
+            return next;
+          });
         } else {
-          setter(prev => prev.map(x => x.id === camel.id ? camel : x));
+          setter(prev => {
+            const next = prev.map(x => x.id === camel.id ? camel : x);
+            if (prevDataRef.current.initialized) prevDataRef.current[key] = next;
+            return next;
+          });
         }
       } else if (eventType === "DELETE" && oldRow) {
-        setter(prev => prev.filter(x => x.id !== oldRow.id));
+        setter(prev => {
+          const next = prev.filter(x => x.id !== oldRow.id);
+          if (prevDataRef.current.initialized) prevDataRef.current[key] = next;
+          return next;
+        });
       }
     };
 
@@ -2496,25 +2541,25 @@ function TeacherApp({ onSwitchToStudent, onLogout, session }) {
       .channel(`org-${orgId}`)
       .on("postgres_changes",
         { event: "*", schema: "public", table: "students", filter: `org_id=eq.${orgId}` },
-        (p) => handleRealtime(setStudents, p))
+        (p) => handleRealtime("students", setStudents, p))
       .on("postgres_changes",
         { event: "*", schema: "public", table: "classes", filter: `org_id=eq.${orgId}` },
-        (p) => handleRealtime(setClasses, p))
+        (p) => handleRealtime("classes", setClasses, p))
       .on("postgres_changes",
         { event: "*", schema: "public", table: "payments", filter: `org_id=eq.${orgId}` },
-        (p) => handleRealtime(setPayments, p))
+        (p) => handleRealtime("payments", setPayments, p))
       .on("postgres_changes",
         { event: "*", schema: "public", table: "lesson_notes", filter: `org_id=eq.${orgId}` },
-        (p) => handleRealtime(setNotes, p))
+        (p) => handleRealtime("notes", setNotes, p))
       .on("postgres_changes",
         { event: "*", schema: "public", table: "courses", filter: `org_id=eq.${orgId}` },
-        (p) => handleRealtime(setCourses, p))
+        (p) => handleRealtime("courses", setCourses, p))
       .on("postgres_changes",
         { event: "*", schema: "public", table: "enrollments", filter: `org_id=eq.${orgId}` },
-        (p) => handleRealtime(setEnrollments, p))
+        (p) => handleRealtime("enrollments", setEnrollments, p))
       .on("postgres_changes",
         { event: "*", schema: "public", table: "booking_requests", filter: `org_id=eq.${orgId}` },
-        (p) => handleRealtime(setBookingRequests, p))
+        (p) => handleRealtime("bookingRequests", setBookingRequests, p))
       .subscribe((status) => {
         if (status === "SUBSCRIBED") console.log("[realtime] connected");
       });
@@ -2536,21 +2581,14 @@ function TeacherApp({ onSwitchToStudent, onLogout, session }) {
     document.documentElement.setAttribute("data-theme", prefs.theme);
   }, [prefs]);
 
-  // === Sync changes to Supabase (debounced via prev ref) ===
-  const prevDataRef = useRef({});
+  // === Sync changes to Supabase (only after fetch completed) ===
   useEffect(() => {
+    // Skip if Supabase not ready or still loading initial data
     if (!sb || !orgId || supaLoading) return;
-    // Skip first render (data just loaded)
-    if (!prevDataRef.current.initialized) {
-      prevDataRef.current = {
-        students, classes, payments, notes, courses, enrollments, bookingRequests,
-        cats: settings.categories, lvls: settings.levels, tps: settings.topics,
-        locs: settings.locations, tchs: settings.teachers,
-        initialized: true,
-      };
-      return;
-    }
-    // Sync each table that changed
+    // Skip if prevDataRef not initialized yet (fetch hasn't completed)
+    if (!prevDataRef.current.initialized) return;
+
+    // Sync each table that changed (compare reference)
     const prev = prevDataRef.current;
     if (prev.students !== students) supaSync("students", prev.students, students, orgId);
     if (prev.classes !== classes) supaSync("classes", prev.classes, classes, orgId);
@@ -3986,7 +4024,7 @@ function CourseForm({ ctx, onClose, existing }) {
     if (!form.description.trim()) return alert("กรุณากรอกคำอธิบาย");
     const saved = {
       ...form,
-      id: existing?.id || `cr${Date.now()}`,
+      id: existing?.id || newId(),
       price: form.pricingMode === "total-hours" ? Number(form.pricePerHour) || 0 : Number(form.price) || 0,
       totalHours: form.pricingMode === "total-hours" ? Number(form.totalHours) || 0 : null,
       pricePerHour: form.pricingMode === "total-hours" ? Number(form.pricePerHour) || 0 : null,
@@ -4415,7 +4453,7 @@ function SellCourseModal({ ctx, onClose, course, onNavigate }) {
     // ============ GROUP MODE ============
     if (isGroup) {
       const orderId = nextOrderId();
-      const groupId = `grp${Date.now()}`; // shared group identifier
+      const groupId = newId(); // shared group identifier
       const newStudentsList = [];
       const enrollmentsList = [];
       const paymentsList = [];
@@ -4427,7 +4465,7 @@ function SellCourseModal({ ctx, onClose, course, onNavigate }) {
         let stId;
         if (gs.type === "new") {
           if (!gs.name) return;
-          stId = `s${Date.now()}_${idx}`;
+          stId = newId();
           newStudentsList.push({
             id: stId, name: gs.name, nickname: gs.nickname || "", age: 0,
             categoryId: course.categoryId || course.category,
@@ -4518,9 +4556,9 @@ function SellCourseModal({ ctx, onClose, course, onNavigate }) {
     let finalStudentId = selectedStudentId;
 
     if (studentType === "new" && newStudent.name) {
-      const newId = `s${Date.now()}`;
+      const newStId = newId();
       const newSt = {
-        id: newId, name: newStudent.name, nickname: newStudent.nickname || "", age: Number(newStudent.age) || 0,
+        id: newStId, name: newStudent.name, nickname: newStudent.nickname || "", age: Number(newStudent.age) || 0,
         categoryId: course.categoryId || course.category,
         category: course.category || course.categoryId,
         subcategory: course.name,
@@ -4531,7 +4569,7 @@ function SellCourseModal({ ctx, onClose, course, onNavigate }) {
         active: true, startDate: todayISO(),
       };
       setStudents(prev => [...prev, newSt]);
-      finalStudentId = newId;
+      finalStudentId = newStId;
     }
 
     const orderId = nextOrderId();
@@ -8273,7 +8311,7 @@ function StudentForm({ ctx, onClose, existing }) {
     const lvlObj = catLvlsActive.find(l => l.id === form.levelId);
     const n = {
       ...form,
-      id: existing?.id || `s${Date.now()}`,
+      id: existing?.id || form.id || newId(),
       age: Number(form.age) || 0,
       rate: Number(form.rate) || 0,
       categoryId: form.categoryId || form.category,
@@ -8796,7 +8834,7 @@ function RequestsPage({ ctx, onNavigate }) {
   };
 
   const doApprove = (req) => {
-    const newClassId = `c${Date.now()}`;
+    const newClassId = newId();
     setClasses(prev => [...prev, {
       id: newClassId,
       studentId: req.studentId,
@@ -9366,7 +9404,7 @@ function BookingPage({ ctx, onNavigate }) {
         studentId: en.studentId,
         courseId: selectedGroup.courseId,
         teacherId: teacherId || undefined,
-        groupClassId: `gc${Date.now()}`, // shared identifier — จองครั้งเดียว ทุกคนใช้ id เดียวกัน
+        groupClassId: newId(), // shared identifier — จองครั้งเดียว ทุกคนใช้ id เดียวกัน
         date, startTime, duration: Number(duration),
         location, status: "scheduled", price: 0, note,
       }));
@@ -9398,7 +9436,7 @@ function BookingPage({ ctx, onNavigate }) {
       alert("⚠ ช่วงเวลานี้ชนกับคลาสที่จองไว้แล้ว กรุณาเลือกเวลาอื่น");
       return;
     }
-    const id = `c${Date.now()}`;
+    const id = newId();
     const hrs = Number(duration) / 60;
 
     setClasses(prev => [...prev, {
@@ -10830,7 +10868,7 @@ function ClassForm({ ctx, onClose, existing }) {
 
   const submit = () => {
     if (!form.studentId) return alert("กรุณาเลือกนักเรียน");
-    const n = { ...form, id: existing?.id || `c${Date.now()}`, duration: Number(form.duration), price: Number(form.price) };
+    const n = { ...form, id: existing?.id || newId(), duration: Number(form.duration), price: Number(form.price) };
     setClasses(prev => existing ? prev.map(c => c.id === existing.id ? n : c) : [...prev, n]);
     onClose();
   };
@@ -11047,7 +11085,7 @@ function NoteForm({ ctx, onClose, prefill }) {
 
     if (classInfo.isGroup) {
       // Create 1 note per student in group, share groupNoteId
-      const groupNoteId = `gn${Date.now()}`;
+      const groupNoteId = newId();
       const newNotes = classInfo.members.map((m, idx) => ({
         id: newId(),
         studentId: m.studentId,
