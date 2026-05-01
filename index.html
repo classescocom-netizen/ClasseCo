@@ -882,16 +882,19 @@ const TABLE_MAP = {
   bookingRequests: "booking_requests",
 };
 
+// Tables that have soft-delete (deleted_at column)
+const SOFT_DELETE_TABLES = new Set(["students", "courses", "enrollments", "payments", "classes", "lesson_notes", "teachers"]);
+
 // Fetch all rows from a table for current org
 const supaFetchAll = async (tableName, orgId) => {
   if (!sb || !orgId) return null;
   try {
-    const { data, error } = await sb
-      .from(tableName)
-      .select("*")
-      .eq("org_id", orgId)
-      .is("deleted_at", null)
-      .order("created_at", { ascending: false });
+    let query = sb.from(tableName).select("*").eq("org_id", orgId);
+    if (SOFT_DELETE_TABLES.has(tableName)) {
+      query = query.is("deleted_at", null);
+    }
+    query = query.order("created_at", { ascending: false });
+    const { data, error } = await query;
     if (error) {
       console.error(`[supaFetchAll] ${tableName}:`, error);
       return null;
@@ -960,6 +963,8 @@ const setSyncState = (patch) => {
 const supaSync = async (tableName, oldArr, newArr, orgId) => {
   if (!sb || !orgId) return;
   const { upserts, deletes } = computeArrayDiff(oldArr, newArr);
+  console.log(`[supaSync] ${tableName}: ${upserts.length} upserts, ${deletes.length} deletes`,
+    { oldLen: oldArr?.length, newLen: newArr?.length });
   if (upserts.length === 0 && deletes.length === 0) return;
 
   setSyncState({ state: "syncing", message: `Syncing ${tableName}...` });
@@ -968,35 +973,58 @@ const supaSync = async (tableName, oldArr, newArr, orgId) => {
     if (upserts.length > 0) {
       // Skip rows with non-UUID ids (legacy seed data with ids like "s1", "cr1")
       const validUpserts = upserts.filter(r => r.id && isUUID(r.id));
+      const skipped = upserts.length - validUpserts.length;
       if (validUpserts.length === 0) {
-        setSyncState({ state: "synced", message: `Skipped ${upserts.length} legacy rows in ${tableName}` });
+        console.warn(`[supaSync] ${tableName}: all ${upserts.length} rows have non-UUID ids — skipped`,
+          upserts.map(r => r.id));
+        setSyncState({ state: "synced", message: `⚠ Skipped ${upserts.length} legacy rows in ${tableName}` });
         return;
+      }
+      if (skipped > 0) {
+        console.warn(`[supaSync] ${tableName}: skipped ${skipped} non-UUID rows`);
       }
       const snakeRows = validUpserts.map(r => {
         const snaked = { ...snakeize(r), org_id: orgId };
         return filterForSchema(snaked, tableName);
       });
-      const { error } = await sb.from(tableName).upsert(snakeRows, { onConflict: "id" });
+      console.log(`[supaSync] ${tableName} payload:`, JSON.stringify(snakeRows, null, 2));
+      const { data, error } = await sb.from(tableName).upsert(snakeRows, { onConflict: "id" }).select();
       if (error) {
-        setSyncState({ state: "error", lastError: `${tableName}: ${error.message}`, message: `❌ ${tableName}: ${error.message}` });
+        console.error(`[supaSync] ${tableName} upsert FAILED:`, JSON.stringify(error, null, 2));
+        setSyncState({ state: "error", lastError: `${tableName}: ${error.message} | ${error.details || ''} | ${error.hint || ''}`, message: `❌ ${tableName}: ${error.message}` });
         return;
       }
-      setSyncState({ state: "synced", lastSyncAt: new Date(), message: `✓ ${tableName}: ${validUpserts.length} rows` });
+      console.log(`[supaSync] ${tableName} upsert OK:`, data);
+      setSyncState({ state: "synced", lastSyncAt: new Date(), message: `✓ ${tableName}: ${validUpserts.length} rows saved` });
     }
     if (deletes.length > 0) {
       const validDeletes = deletes.filter(id => isUUID(id));
-      if (validDeletes.length === 0) return;
-      const { error } = await sb
-        .from(tableName)
-        .update({ deleted_at: new Date().toISOString() })
-        .in("id", validDeletes);
+      if (validDeletes.length === 0) {
+        console.log(`[supaSync] ${tableName}: ${deletes.length} legacy deletes ignored`);
+        return;
+      }
+      console.log(`[supaSync] ${tableName} deleting:`, validDeletes);
+      let error;
+      if (SOFT_DELETE_TABLES.has(tableName)) {
+        // Soft delete (set deleted_at)
+        const res = await sb.from(tableName)
+          .update({ deleted_at: new Date().toISOString() })
+          .in("id", validDeletes);
+        error = res.error;
+      } else {
+        // Hard delete (no deleted_at column)
+        const res = await sb.from(tableName).delete().in("id", validDeletes);
+        error = res.error;
+      }
       if (error) {
-        setSyncState({ state: "error", lastError: `delete ${tableName}: ${error.message}`, message: `❌ delete ${tableName}` });
+        console.error(`[supaSync] ${tableName} delete FAILED:`, error);
+        setSyncState({ state: "error", lastError: `delete ${tableName}: ${error.message}`, message: `❌ delete ${tableName}: ${error.message}` });
         return;
       }
       setSyncState({ state: "synced", lastSyncAt: new Date(), message: `✓ deleted ${validDeletes.length} from ${tableName}` });
     }
   } catch (err) {
+    console.error(`[supaSync] ${tableName} EXCEPTION:`, err);
     setSyncState({ state: "error", lastError: err.message, message: `❌ ${tableName}: ${err.message}` });
   }
 };
@@ -1042,9 +1070,26 @@ const filterForSchema = (row, tableName) => {
   if (tableName === "payments") {
     if (row.slip_url === undefined && row.slipUrl) row.slip_url = row.slipUrl;
   }
+  // Date/numeric fields that don't accept empty strings
+  const DATE_FIELDS = ["start_date", "enrolled_date", "payment_date", "class_date", "note_date", "requested_date", "responded_at", "trial_ends_at", "subscription_starts_at", "subscription_ends_at", "locked_at"];
+  const NUMERIC_FIELDS = ["age", "default_rate", "rate", "price", "duration", "total_hours", "price_per_hour", "max_students", "max_teachers", "max_students_count", "total_sessions", "completed_sessions", "total_price", "paid_amount", "amount", "total_amount", "duration_minutes", "sort_order"];
+  // FK fields that must be valid UUID or null
+  const UUID_FIELDS = ["category_id", "level_id", "default_location_id", "course_id", "student_id", "enrollment_id", "teacher_id", "group_class_id", "user_id", "parent_payment_id", "class_id", "group_id", "approved_class_id", "responded_by", "group_note_id"];
   const out = {};
   for (const key of allowed) {
-    if (row[key] !== undefined) out[key] = row[key];
+    let v = row[key];
+    if (v === undefined) continue;
+    if (v === "") {
+      if (DATE_FIELDS.includes(key) || NUMERIC_FIELDS.includes(key) || UUID_FIELDS.includes(key)) {
+        v = null;
+      }
+    }
+    // FK UUID fields — null if not valid UUID
+    if (UUID_FIELDS.includes(key) && v !== null && !isUUID(v)) {
+      console.warn(`[filterForSchema] ${tableName}.${key}: dropping non-UUID value:`, v);
+      v = null;
+    }
+    out[key] = v;
   }
   return out;
 };
@@ -8307,17 +8352,12 @@ function StudentForm({ ctx, onClose, existing }) {
   };
 
   const submit = () => {
-    if (!form.name || !form.subcategory) return alert("กรุณากรอกชื่อและประเภทคลาส");
-    const lvlObj = catLvlsActive.find(l => l.id === form.levelId);
+    if (!form.name) return alert("กรุณากรอกชื่อ");
     const n = {
       ...form,
       id: existing?.id || form.id || newId(),
       age: Number(form.age) || 0,
       rate: Number(form.rate) || 0,
-      categoryId: form.categoryId || form.category,
-      category: form.category || form.categoryId,
-      levelId: form.levelId,
-      level: lvlObj?.name || form.level || "",
     };
     ctx.setStudents(prev => existing ? prev.map(s => s.id === existing.id ? n : s) : [...prev, n]);
     onClose();
@@ -8337,33 +8377,6 @@ function StudentForm({ ctx, onClose, existing }) {
             <input className={inputCls} style={inputSty} value={form.nickname || ""} onChange={e => setForm({ ...form, nickname: e.target.value })} placeholder="ฝน" />
           </FormRow>
           <FormRow label={t("age")}><input className={inputCls} style={inputSty} type="number" value={form.age} onChange={e => setForm({ ...form, age: e.target.value })} /></FormRow>
-          <div className="grid grid-cols-2 gap-3">
-            <FormRow label="ประเภท">
-              <select className={inputCls} style={inputSty} value={form.categoryId || form.category}
-                onChange={e => setForm({ ...form, categoryId: e.target.value, category: e.target.value, levelId: "" })}>
-                {cats.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-              </select>
-          </FormRow>
-          <FormRow label="รายละเอียดคลาส">
-            <input className={inputCls} style={inputSty} value={form.subcategory} onChange={e => setForm({ ...form, subcategory: e.target.value })} placeholder="เช่น ร้องเพลง+เปียโน" />
-          </FormRow>
-        </div>
-        <FormRow label={t("level")}>
-          {catLvlsActive.length === 0 ? (
-            <div className="text-[11px] px-3 py-2.5"
-              style={{ background: "var(--info-soft)", color: "var(--info)", borderLeft: "2px solid var(--info)" }}>
-              ℹ ยังไม่มีระดับสำหรับหมวด "{currentCat?.name}" — เพิ่มได้ที่ Settings → ระดับ
-            </div>
-          ) : (
-            <select className={inputCls} style={inputSty} value={form.levelId}
-              onChange={e => setForm({ ...form, levelId: e.target.value })}>
-              <option value="">— เลือกระดับ —</option>
-              {catLvlsActive.map(l => (
-                <option key={l.id} value={l.id}>{l.name}{l.desc ? ` — ${l.desc}` : ""}</option>
-              ))}
-            </select>
-          )}
-        </FormRow>
         <FormRow label={t("parent")}><input className={inputCls} style={inputSty} value={form.parent} onChange={e => setForm({ ...form, parent: e.target.value })} placeholder="คุณวิภา (แม่)" /></FormRow>
         <div className="grid grid-cols-2 gap-3">
           <FormRow label={t("phone")}><input className={inputCls} style={inputSty} value={form.phone} onChange={e => setForm({ ...form, phone: e.target.value })} placeholder="081-234-5678" /></FormRow>
