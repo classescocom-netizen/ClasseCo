@@ -10527,7 +10527,10 @@ function BookingPage({ ctx, onNavigate }) {
                   const remaining = (en.totalPrice || 0) - (en.paidAmount || 0);
                   const isSelected = selectedCourseId === c.id;
                   return (
-                    <button key={en.id} onClick={() => setSelectedCourseId(c.id)}
+                    <button key={en.id} onClick={() => {
+                        setSelectedCourseId(c.id);
+                        if (c.location) setLocation(c.location);
+                      }}
                       className="w-full flex items-start gap-3 px-3 py-3 text-left transition-all"
                       style={{
                         background: isSelected ? cCat.bg : "var(--bg-surface)",
@@ -10592,10 +10595,22 @@ function BookingPage({ ctx, onNavigate }) {
 
           <FormRow label={t("location")}>
             <select className={inputCls} style={inputSty} value={location} onChange={e => setLocation(e.target.value)}>
+              {selectedCourse?.location && !(settings?.locations || DEFAULT_SETTINGS.locations).some(l => l.active && l.name === selectedCourse.location) && (
+                <option value={selectedCourse.location}>📍 {selectedCourse.location} (จากคอร์ส)</option>
+              )}
               {(settings?.locations || DEFAULT_SETTINGS.locations).filter(l => l.active).map(l => (
-                <option key={l.id} value={l.name}>{l.icon} {l.name}</option>
+                <option key={l.id} value={l.name}>
+                  {l.icon} {l.name}{selectedCourse?.location === l.name ? " ✓" : ""}
+                </option>
               ))}
             </select>
+            {selectedCourse?.location && (
+              <div className="text-[10px] mt-1.5" style={{ color: "var(--text-tertiary)" }}>
+                {location === selectedCourse.location
+                  ? `✓ ใช้สถานที่ default จากคอร์ส`
+                  : `💡 Default จากคอร์ส: ${selectedCourse.location}`}
+              </div>
+            )}
           </FormRow>
 
           {hasMultiTeacher && (
